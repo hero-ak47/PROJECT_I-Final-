@@ -1,0 +1,127 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+-- Bộ lọc FIR dạng trực tiếp với đường trễ và MAC (Multiply-Accumulate)
+entity FIR_Filter is
+    generic(
+        FILTER_TAPS : integer := 60;                              -- Số lượng hệ số lọc (tap)
+        INPUT_WIDTH : integer range 8 to 32 := 12;                -- Độ rộng dữ liệu vào (số bit)
+        COEFF_WIDTH : integer range 8 to 32 := 16;                -- Độ rộng hệ số lọc
+        OUTPUT_WIDTH : integer range 8 to 32 := 12;               -- Độ rộng dữ liệu xuất (đã thu nhỏ / làm tròn)
+        WAITING_TIME : integer := 10;
+        ADDR_WIDTH : integer range 8 to 32 := 8
+    );
+    Port ( 
+        clk : in STD_LOGIC;                                      -- Clock hệ thống
+        fsclk : in STD_LOGIC;                                     -- Xung lấy mẫu (khi lên cạnh thì lấy mẫu mới)
+        data_i  : in STD_LOGIC_Vector(INPUT_WIDTH-1 downto 0);    -- Dữ liệu đầu vào (dạng unsigned/signed tùy xử lý phía ngoài)
+        data_o  : out STD_LOGIC_Vector(INPUT_WIDTH-1 downto 0)    -- Dữ liệu đầu ra sau lọc
+    );
+end FIR_Filter;
+
+architecture Behavioral of FIR_Filter is
+
+-- Khai báo đường trễ, chứa các mẫu đã vào trước đây
+-- delay_line_s(0) là mẫu mới nhất, delay_line_s(FILTER_TAPS-1) là mẫu cũ nhất
+-- Mỗi mẫu là số signed có độ rộng INPUT_WIDTH
+
+type input_registers is array(0 to FILTER_TAPS-1) of signed(INPUT_WIDTH-1 downto 0);
+signal delay_line_s  : input_registers := (others=>(others=>'0'));
+
+-- Mảng hệ số FIR, đã cho sẵn, 60 hệ số dạng signed 16 bit
+-- Hệ số đối xứng, đây là bộ lọc thông dải thiết kế trước (có thể thay bằng hệ số lọc thông thấp, cao,.. tuỳ mục đích sử dụng )
+type coefficients is array (0 to 59) of signed( 15 downto 0);
+signal coeff_s: coefficients :=(
+    x"FF53", x"FFF7", x"003D", x"00A5", x"010E", x"0149", x"012D",
+    x"00A3", x"FFB7", x"FE9A", x"FD9B", x"FD15", x"FD50", x"FE63",
+    x"0025", x"0231", x"03F8", x"04E8", x"04A0", x"030A", x"0073",
+    x"FD79", x"FAE7", x"F97B", x"F9AD", x"FB89", x"FEA3", x"0233",
+    x"054A", x"0713", x"0713", x"054A", x"0233", x"FEA3", x"FB89",
+    x"F9AD", x"F97B", x"FAE7", x"FD79", x"0073", x"030A", x"04A0",
+    x"04E8", x"03F8", x"0231", x"0025", x"FE63", x"FD50", x"FD15",
+    x"FD9B", x"FE9A", x"FFB7", x"00A3", x"012D", x"0149", x"010E",
+    x"00A5", x"003D", x"FFF7", x"FF53"
+);
+
+-- Lưu giá trị fsclk trễ 1 chu kỳ để phát hiện cạnh lên
+signal fsclk_q : std_logic := '0';
+
+-- Máy trạng thái đơn giản: chờ -> xử lý
+
+type state_machine is (idle_st, active_st);
+signal state : state_machine := idle_st;
+
+-- Bộ đếm để duyệt qua tất cả các tap từ cuối về đầu
+signal counter : integer range 0 to FILTER_TAPS-1 := FILTER_TAPS-1;
+
+-- accumulator: tích luỹ kết quả nhân MAC
+signal output       : signed(INPUT_WIDTH+COEFF_WIDTH-1 downto 0) := (others=>'0');
+signal accumulator  : signed(INPUT_WIDTH+COEFF_WIDTH-1 downto 0) := (others=>'0');
+
+begin
+
+-- Thu nhỏ và làm tròn kết quả ra
+-- Lấy các bit trọng số phù hợp để tránh tràn ( do DAC chỉ nhận giá trị dương)
+-- Cộng thêm 2^(OUTPUT_WIDTH-1) để làm tròn (rounding), sau đó shift phải 1 bit
+
+data_o <= std_logic_vector(
+    shift_right(
+        unsigned(output(INPUT_WIDTH+COEFF_WIDTH-2 downto INPUT_WIDTH+COEFF_WIDTH-OUTPUT_WIDTH-1))
+        + to_unsigned(2**(OUTPUT_WIDTH-1), OUTPUT_WIDTH),
+        1
+    )
+);
+
+process(clk)
+    -- sum_v dùng dạng variable để đảm bảo tính trong chu kỳ clock
+    variable sum_v : signed(INPUT_WIDTH+COEFF_WIDTH-1 downto 0) := (others=>'0');
+begin
+    if rising_edge(clk) then
+        -- Ghi lại fsclk cũ để phát hiện cạnh
+        fsclk_q <= fsclk;
+
+        case state is
+
+        -- Trạng thái chờ: đợi khi fsclk lên cạnh (mẫu mới sẵn sàng)
+        when idle_st =>
+            if fsclk = '1' and fsclk_q = '0' then  -- Phát hiện cạnh lên
+                state <= active_st;
+            end if;
+
+        -- Trạng thái xử lý MAC ( MAC là tích của các hệ số lọc với các sample hiện tại - các tích trong phép chập) 
+        when active_st =>
+
+            -- Đếm từ FILTER_TAPS-1 xuống 0
+            if counter > 0 then
+                counter <= counter - 1;
+            else
+                counter <= FILTER_TAPS-1;   -- Kết thúc lượt MAC, reset counter
+                state <= idle_st;           -- Quay về trạng thái chờ mẫu tiếp
+            end if;
+
+            -- Dịch mẫu trong đường trễ
+            -- delay_line_s(counter) nhận giá trị của delay_line_s(counter-1)
+            -- Khi counter = 0: ghi mẫu mới vào delay_line_s(0)
+            if counter > 0 then
+                delay_line_s(counter) <= delay_line_s(counter-1);
+            else
+                delay_line_s(counter) <= signed(data_i); -- Nạp mẫu mới
+            end if;
+
+            -- Thực hiện phép nhân và cộng (MAC)
+            if counter > 0 then
+                sum_v := delay_line_s(counter) * coeff_s(counter);
+                accumulator <= accumulator + sum_v; -- Tích luỹ vào accumulator
+            else
+                -- Tại tap cuối cùng: reset tích luỹ và cập nhật output
+                accumulator <= (others=>'0');
+                sum_v := delay_line_s(counter) * coeff_s(counter);
+                output <= accumulator + sum_v;  -- Ghi kết quả cho kỳ này
+            end if;
+
+        end case;
+    end if;
+end process;
+
+end Behavioral;
