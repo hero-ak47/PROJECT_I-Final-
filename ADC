@@ -1,0 +1,193 @@
+
+-- HERO--
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.common_package.all; 
+
+entity adc is
+  generic(
+     sample_size : integer := 20 -- Number of bits in 1 sample of ADC -- 
+    );
+
+Port(
+     reset       : in std_logic;
+     clk         : in std_logic;
+     start_tx    : in std_logic;    
+     adc_cs_n    : out STD_LOGIC;
+     adc_sck     : out STD_LOGIC;
+     adc_sdi     : out STD_LOGIC;
+     adc_sdo     : in STD_LOGIC;
+     d_out       : out std_logic_vector(11 downto 0)
+
+ );
+end adc;
+
+
+architecture Behavioral of adc is
+type state_type is (IDLE,  LOAD, TRANSMIT, FINISH);   -- 4 trạng thái của máy FSM --
+
+-- Khai báo hằng số --
+constant d_in         : std_logic_vector( sample_size -1 downto 0) := "11000000000000000000";  -- dữ liệu để đưa vào chân MOSI : Start, SGL, D2, D1, D0 + 14-bit dontcare
+
+constant SAMPLE_WIDTH : integer      :=  sample_size;        -- kích thước 1 mẫu ADC : 20bit
+constant SCK_DIV      : integer      :=  100;                -- chia xung hệ thống cho 100 ( từ 100MHz -> 1Mhz)
+
+signal state_reg, state_next : state_type;
+
+signal bit_count_reg, bit_count_next : unsigned(7 downto 0); -- bộ đếm dịch bit SPI
+signal sck_count_reg, sck_count_next : unsigned(7 downto 0); -- bộ đếm chia xung sck
+
+signal shift_reg, shift_reg_next     : std_logic_vector( sample_size -1  downto 0);  -- thanh ghi lưu data(20 bits) MOSI ( FPGA truyền cho MCP3204)
+signal shift_reg_1,shift_reg_next_1  : STD_LOGIC_VECTOR(SAMPLE_WIDTH-1 downto 0) ;   -- thanh ghi lưu data(20 bits) MISO ( MCP3204 truyền cho MCP3204)
+signal d_out_reg, d_out_next         : std_logic_vector( 11 downto 0);               -- thanh ghi lưu data (12 bits) các mẫu đã được số hoá từ ADC
+  
+signal rx_done_reg, rx_done_next     : std_logic;  -- cờ báo đã truyền xong 1 mẫu ADC
+signal busy_reg, busy_next           : std_logic;  -- cờ báo ADC bận
+
+-- Các tín hiệu quá trình của các chân ADC
+signal adc_cs_n_reg, adc_cs_n_next   : std_logic;  -- chip select
+signal adc_sck_reg, adc_sck_next     : std_logic;  -- xung sck
+signal adc_sdi_reg, adc_sdi_next     : std_logic;  -- MOSI (input của MCP3204)
+signal adc_sdo_reg, adc_sdo_next     : std_logic;  -- MISO (output của MCP3204)
+
+
+
+begin
+
+-- Tiến trình hoạt động của hệ thống --
+process(clk, reset)
+begin
+    if (reset = '1') then
+    -- Reset tất cả các thanh ghi
+        state_reg <= IDLE;
+        
+        bit_count_reg <= (others => '0');
+        sck_count_reg <= (others => '0');
+        
+        shift_reg <= (others => '0');
+        shift_reg_1 <= (others => '0');
+        
+        rx_done_reg <= '0';
+        busy_reg  <= '0';
+        
+        adc_cs_n_reg <= '1';
+        adc_sck_reg  <= '0';
+        adc_sdi_reg   <= '0';
+        adc_sdo_reg    <= '0';
+        d_out_reg <= (others => '0');
+    elsif falling_edge(clk) then
+    -- Cập nhật các thanh ghi
+        state_reg <= state_next;
+        
+        bit_count_reg <= bit_count_next;
+        sck_count_reg <= sck_count_next;
+        
+        shift_reg <= shift_reg_next;
+        shift_reg_1 <= shift_reg_next_1;
+        
+        rx_done_reg <= rx_done_next;
+        busy_reg <= busy_next;
+        
+        adc_cs_n_reg <= adc_cs_n_next;
+        adc_sck_reg <= adc_sck_next;
+        adc_sdi_reg <= adc_sdi_next;
+        adc_sdo_reg  <= adc_sdo_next;
+        d_out_reg <= d_out_next;
+    end if;
+end process;
+
+process(     state_reg,          bit_count_reg,                  sck_count_reg,
+             shift_reg,          shift_reg_1,                    adc_sdo,
+             d_out_reg,          shift_reg_1,                    adc_cs_n_reg ,
+             adc_sck_reg,        adc_sdi_reg,                    busy_reg,
+             rx_done_reg,        start_tx)
+begin 
+
+  -- Khởi tạo các giá trị ban đầu
+    state_next        <= state_reg;
+    
+    bit_count_next    <= bit_count_reg;
+    sck_count_next    <= sck_count_reg;
+    
+    shift_reg_next    <= shift_reg;      -- sdi
+    shift_reg_next_1  <= shift_reg_1;    -- sdo
+    
+    adc_cs_n_next     <= adc_cs_n_reg;
+    adc_sck_next      <= adc_sck_reg;
+    adc_sdi_next      <= adc_sdi_reg;
+    d_out_next        <= d_out_reg;
+    
+    busy_next         <= busy_reg;
+    rx_done_next      <= '0';            -- ban đầu chưa bận
+    
+  -- Máy trạng thái 
+    case state_reg is
+        -------------- IDLE ------------------
+        when IDLE =>
+            adc_cs_n_next  <= '1';             -- CS ở mức cao
+            adc_sck_next   <= '0';             -- Chưa có xung SCK
+            busy_next      <= '0';             -- Chưa báo bận
+            sck_count_next <= (others => '0'); -- Reset bộ đếm xung SCk
+            -- Khi có tín hiệu start = 1 
+            if start_tx = '1' then
+                state_next <= LOAD;            -- Chuyển trạng thái sang LOAD
+                busy_next  <= '1';              -- Báo bận
+            end if;
+        --------------------------------------------------------------------------------------------
+        
+        -------------- LOAD ------------------------------------------------------------------------
+        when LOAD =>        
+            shift_reg_next <= d_in;            -- nạp data FPGA truyền cho thanh ghi (11000 + 14 bits don't care)           
+            bit_count_next <= to_unsigned(SAMPLE_WIDTH-1, bit_count_next'length);  -- chuyển bộ đếm sck thành kiểu unsigned và tại xung clk tiếp theo bộ đếm được reset về giá trị 19
+            adc_cs_n_next  <= '0';             -- kéo CS xuống để bắt đầu khung truyền
+            state_next     <= TRANSMIT;        -- chuyển trạng thái sang TRANSMIT
+        --------------------------------------------------------------------------------------------
+        
+        -----------TRANSMIT ------------------------------------------------------------------------    
+        when TRANSMIT => 
+            sck_count_next <= sck_count_reg + 1; -- mỗi xung clk lại tăng sck_count lên 1
+            -- Cách chia xung sck 1MHz --
+            case sck_count_reg is
+                when "00000000" =>        -- (0) bắt đầu 1 chu kỳ sck
+                    adc_sck_next <= '0';  -- đầu chu kỳ, sck ở trạng thái low                   
+                    adc_sdi_next <= shift_reg(SAMPLE_WIDTH-1);  -- nạp bit MSB - bit trái nhất của thanh ghi (MOSI) vào chân sdi
+                when "00110001" =>        -- (49) đến giữa chu kỳ sck
+                    adc_sck_next <= '1';  -- sck đổi trạng thái từ 0 lên 1 khi đến giữa chu kỳ (cạnh lên của sck)                 
+                when "01100011" =>        -- (99) kết thúc một chu kỳ
+                    adc_sck_next <= '0';  -- sck đổi trạng thái từ 1 xuống 0 khi kết thúc 1 chu kỳ  
+          
+                    shift_reg_next   <= shift_reg(SAMPLE_WIDTH-2 downto 0) & '0';       -- cập nhật thanh ghi lưu data MOSI bằng cách dịch bit trái nhất ra khỏi thanh ghi và thêm bit 0 vào bit phải nhất 
+                    shift_reg_next_1 <= shift_reg_1(SAMPLE_WIDTH-2 downto 0) & adc_sdo; -- cập nhật thanh ghi lưu data MISO bằng cách dịch bit trái nhất ra khỏi thanh ghi và thêm bit sdo_adc (data sample) vào bit phải nhất 
+                    if bit_count_reg = 0 then                       -- đến khi bộ đếm bit về 0  (ban đầu là 19)                                     
+                        d_out_next   <= shift_reg_1(11 downto 0);   -- chốt data cho 1 sample  
+                        state_next <= FINISH;                       -- chuyển trạng thái sang FINISH
+                    else                                            -- khi bộ đếm bit chưa về 0
+                        bit_count_next <= bit_count_reg - 1;        -- giảm bộ đếm đi 1 đơn vị
+                    end if;
+                    sck_count_next <= (others => '0');              -- reset bộ đếm xung sck
+                when others => 
+                    null;
+            end case;
+        --------------------------------------------------------------------------------------------
+        
+        -- FINISH ----------------------------------------------------------------------------------   
+        when FINISH => 
+            adc_cs_n_next <= '1';
+            adc_sck_next <= '0';
+            rx_done_next <= '1';          
+            state_next <= IDLE;
+        --------------------------------------------------------------------------------------------    
+    end case;
+      
+end process;
+
+-- Gán các tín hiệu vào các port
+  d_out    <= d_out_reg; 
+  adc_cs_n <= adc_cs_n_reg;
+  adc_sck  <= adc_sck_reg;  
+  adc_sdi  <= adc_sdi_reg;
+--------------------------------
+
+end Behavioral;
