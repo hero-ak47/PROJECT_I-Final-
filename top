@@ -1,0 +1,89 @@
+
+-- HERO --
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity top_system is
+    Port (
+           -- clock và reset --
+        clk        : in  std_logic;   -- clock hệ thống (ví dụ 50 MHz)        
+        rst        : in std_logic;
+        
+           -- ADC --
+        sclk       : out std_logic;
+        miso_adc   : in  std_logic;   -- từ ADC
+        mosi_adc   : out std_logic;
+        cs_adc     : inout std_logic;
+        rx_done    : out std_logic;
+        
+        -- tín hiệu testbench (bỏ comment khi mô phỏng) ------  
+        adc_data         : out std_logic_vector(11 downto 0); 
+        filter_out_check : out std_logic_vector(11 downto 0);
+        ------------------------------------------------------
+          -- DAC --
+        cs_dac     : out std_logic;
+        sck_dac    : out std_logic;
+        dac_out    : out std_logic 
+    );
+end top_system;
+
+architecture Behavioral of top_system is
+    signal adc_data_out   : std_logic_vector(11 downto 0);   -- output của ADC
+    signal filter_out     : std_logic_vector(11 downto 0);   -- output của bộ lọc
+    signal filter_in      : std_logic_vector(11 downto 0);   -- input của bộ lọc 
+    signal dac_data_in    : std_logic_vector(11 downto 0);   -- input của DAC
+   
+begin
+    --------------------------------------------------------------------
+    -- ADC instance
+    --------------------------------------------------------------------
+    u_adc: entity work.adc
+        port map (
+            clk         => clk,           -- clk hệ thống 100MHz
+            reset       => rst,           -- reset hệ thống
+            start_tx    => '1',           -- luôn đọc liên tục
+            adc_sdo     => miso_adc,      -- MISO
+            adc_cs_n    => cs_adc,        -- CS
+            adc_sdi     => mosi_adc,      -- MOSI
+            adc_sck     => sclk,          -- xung 1MHz ADC
+            d_out       => adc_data_out   -- output của ADC
+        );
+        
+    filter_in <= adc_data_out;
+    
+    ------------------------
+    -- tín hiệu testbench (bỏ comment khi mô phỏng) --
+    adc_data  <= filter_in;
+    ------------------------
+    
+
+    -- FILTER 
+
+    u_fir: entity work.FIR_Filter
+        port map (
+            clk     => clk,       -- clk hệ thống 100MHz
+            fsclk   => cs_adc,    -- xung fsclk của bộ lọc chính là cs của ADC (do mỗi khi có xung cs thì có 1 mẫu mới -> fir bắt đầu lặp lại quy trình chập) 
+            data_i  => filter_in, -- input bộ lọc
+            data_o  => filter_out -- output bộ lọc
+        );
+     dac_data_in <= filter_out;
+     
+    -------------------------------   
+    -- tín hiệu testbench (bỏ comment khi mô phỏng) --   
+    filter_out_check <= filter_out;
+    -------------------------------
+    
+
+        -- DAC 
+    u_dac: entity work.spi_dac_module
+        port map (
+            clk_100M   => clk,         -- clk hệ thống 100MHz
+            start_tx   => '1',         -- luôn đọc liên tục
+            reset_n    => rst,         -- reset hệ thống
+            data_in    => dac_data_in, -- input của ADC         
+            dac_cs_n   => cs_dac,      -- DAC chip select (active low)
+            dac_sck    => sck_dac,     -- DAC serial clock
+            dac_sdi    => dac_out      -- output system
+        );
+end Behavioral;
